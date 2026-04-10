@@ -23,11 +23,17 @@ def register(request):
         if User.objects.filter(username=u_name).exists():
             return render(request, 'register.html', {'error': 'Username is already taken!'})
 
-        # 4. Password validation (Minimum 8 characters)
+
+        # 4. Check if phone number is already registered
+        if User.objects.filter(phone=u_phone).exists():
+            return render(request, 'register.html', {'error': 'This phone number is already in use!'})
+        
+
+        # 5. Password validation (Minimum 8 characters)
         if len(u_pass) < 8:
             return render(request, 'register.html', {'error': 'Password must be at least 8 characters long!'})
         
-        # 5. Check if passwords match
+        # 6. Check if passwords match
         if u_pass != u_confirm:
             return render(request, 'register.html', {'error': 'Passwords do not match!'})
 
