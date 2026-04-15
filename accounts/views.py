@@ -1,76 +1,156 @@
 from django.shortcuts import render, redirect
-from django.contrib.auth import authenticate, login as auth_login, logout as auth_logout
+from django.contrib.auth import authenticate
 from .models import User
 
-# 1. Registration View (With Advanced Validation)
-def register(request):
+
+def infer_role_from_next(next_url):
+    customer_prefixes = (
+        '/create',
+        '/requests/my',
+        '/review/',
+        '/chatbot/',
+    )
+    broker_prefixes = (
+        '/dashboard/',
+        '/broker-stats/',
+        '/broker-landing/',
+        '/requests/broker/',
+        '/quote/',
+    )
+
+    next_url = next_url or '/'
+
+    if any(next_url.startswith(prefix) for prefix in customer_prefixes) or '/edit' in next_url or '/delete' in next_url:
+        return 'customer'
+    if any(next_url.startswith(prefix) for prefix in broker_prefixes):
+        return 'broker'
+    return None
+
+
+def build_login_url(role, next_url=''):
+    login_url = f'/login?role={role}'
+    if next_url:
+        login_url = f"{login_url}&next={next_url}"
+    return login_url
+
+
+def can_register_from_login(next_url):
+    return (next_url or '').startswith('/create')
+
+
+def get_auth_copy(role, next_url=''):
+    if role == 'broker':
+        return 'Login', 'Login with your broker account to continue.'
+    if role == 'customer' and can_register_from_login(next_url):
+        return 'Login', 'Login to continue with your broker request.'
+    if role == 'customer':
+        return 'Login', 'Login with your customer account to continue.'
+    return 'Login', 'Login with your account credentials to continue.'
+
+
+def login_view(request):
+    next_url = request.GET.get('next') or request.POST.get('next') or '/'
+    error_message = None
+    helper_message = None
+    requested_role = (request.GET.get('role') or request.POST.get('role') or '').strip().lower()
+    inferred_role = infer_role_from_next(next_url)
+    active_role = inferred_role or (requested_role if requested_role in {'customer', 'broker'} else None)
+    auth_role_locked = inferred_role is not None or requested_role in {'customer', 'broker'}
+    show_register = can_register_from_login(next_url)
+    auth_title, auth_text = get_auth_copy(active_role, next_url)
+
+    if 'user_id' in request.session:
+        session_role = request.session.get('role')
+        if active_role and session_role == active_role:
+            if next_url not in {'/', '/login'}:
+                return redirect(next_url)
+            if active_role == 'broker':
+                return redirect('/broker-landing/')
+            return redirect('/')
+        if not active_role:
+            if session_role == 'broker':
+                return redirect('/broker-landing/')
+            if session_role == 'customer':
+                return redirect('/')
+
     if request.method == 'POST':
-        u_name = request.POST.get('username')
-        u_email = request.POST.get('email')
-        u_phone = request.POST.get('phone')
-        u_pass = request.POST.get('password')
-        u_confirm = request.POST.get('confirm_password')
+        username = request.POST.get('username', '').strip()
+        password = request.POST.get('password', '')
+        user = authenticate(request, username=username, password=password)
 
-        # 1. Check if any field is empty
-        if not all([u_name, u_email, u_phone, u_pass]):
-            return render(request, 'register.html', {'error': 'All fields are required!'})
+        if user and (active_role is None or user.role == active_role):
+            request.session['user_id'] = user.id
+            request.session['role'] = user.role
+            request.session['username'] = user.username
+            if user.role == 'broker' and (next_url == '/' or next_url == '/login'):
+                return redirect('/broker-landing/')
+            return redirect(next_url)
 
-        # 2. Check if email is already registered
-        if User.objects.filter(email=u_email).exists():
-            return render(request, 'register.html', {'error': 'This email is already registered!'})
-
-        # 3. Check if username is already taken
-        if User.objects.filter(username=u_name).exists():
-            return render(request, 'register.html', {'error': 'Username is already taken!'})
-
-
-        # 4. Check if phone number is already registered
-        if User.objects.filter(phone=u_phone).exists():
-            return render(request, 'register.html', {'error': 'This phone number is already in use!'})
-        
-
-        # 5. Password validation (Minimum 8 characters)
-        if len(u_pass) < 8:
-            return render(request, 'register.html', {'error': 'Password must be at least 8 characters long!'})
-        
-        # 6. Check if passwords match
-        if u_pass != u_confirm:
-            return render(request, 'register.html', {'error': 'Passwords do not match!'})
-
-        # If all checks pass, create the user
-        user = User.objects.create_user(username=u_name, email=u_email, password=u_pass)
-        user.phone = u_phone
-        user.role = 'customer'
-        user.save()
-
-        auth_login(request, user)
-        return redirect('/my-requests') 
-
-    return render(request, 'register.html')
-
-# 2. Login View
-def login(request):
-    if request.method == 'POST':
-        u_name = request.POST.get('username')
-        u_pass = request.POST.get('password')
-
-        # Check if credentials are provided
-        if not u_name or not u_pass:
-            return render(request, 'login.html', {'error': 'Please provide both username and password'})
-
-        # Authenticate user (Check existence and password correctness)
-        user = authenticate(username=u_name, password=u_pass)
-
-        if user is not None:
-            auth_login(request, user)
-            # Role-based redirection
-            return redirect('/dashboard' if user.role == 'broker' else '/my-requests')
+        if user and active_role and user.role != active_role:
+            if active_role == 'broker':
+                error_message = 'You cannot log in as broker because your role is customer.'
+            else:
+                error_message = 'You cannot log in as customer because your role is broker.'
         else:
-            return render(request, 'login.html', {'error': 'Invalid username or password!'})
+            error_message = 'Invalid username or password.'
+            if active_role == 'broker':
+                helper_message = 'Broker accounts are added by admin.'
 
-    return render(request, 'login.html')
+    context = {
+        'next': next_url,
+        'error_message': error_message,
+        'helper_message': helper_message,
+        'show_register': show_register,
+        'auth_title': auth_title,
+        'auth_text': auth_text,
+        'active_role': active_role,
+        'auth_role_locked': auth_role_locked,
+        'customer_login_url': build_login_url('customer', next_url),
+        'broker_login_url': build_login_url('broker', next_url),
+    }
 
-# 3. Logout View
-def logout(request):
-    auth_logout(request)
-    return redirect('/login')
+    return render(request, 'login.html', context)
+
+
+def register_view(request):
+    next_url = request.GET.get('next') or request.POST.get('next') or '/create'
+    error_message = None
+
+    if request.method == 'POST':
+        username = request.POST.get('username', '').strip()
+        email = request.POST.get('email', '').strip()
+        phone = request.POST.get('phone', '').strip()
+        password = request.POST.get('password', '')
+        confirm_password = request.POST.get('confirm_password', '')
+
+        if not username or not email or not phone or not password or not confirm_password:
+            error_message = 'All fields are required.'
+        elif password != confirm_password:
+            error_message = 'Passwords do not match.'
+        elif User.objects.filter(username=username).exists():
+            error_message = 'This username already exists.'
+        else:
+            user = User.objects.create_user(
+                username=username,
+                email=email,
+                password=password,
+                role='customer',
+                phone=phone,
+            )
+            request.session['user_id'] = user.id
+            request.session['role'] = user.role
+            request.session['username'] = user.username
+            return redirect(next_url)
+
+    context = {
+        'next': next_url,
+        'error_message': error_message,
+        'customer_login_url': build_login_url('customer', next_url),
+    }
+
+    return render(request, 'register.html', context)
+
+
+def logout_view(request):
+    request.session.flush()
+    return redirect('/')
